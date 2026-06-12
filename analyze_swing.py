@@ -13,6 +13,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import cv2
 import mediapipe as mp
+from world_rotation import RotationTracker
 
 DEFAULT_MODEL_PATH = Path(".models/pose_landmarker_full.task")
 DEFAULT_MODEL_URL = (
@@ -450,6 +451,8 @@ def analyze_video(
         landmarker = create_pose_landmarker(
             model_path=model_path, running_mode=mp.tasks.vision.RunningMode.VIDEO
         )
+        tracker = RotationTracker(smoothing_window=5)
+        address_set = False
 
         frame_idx = 0
         timestamp_ms = 0
@@ -475,6 +478,15 @@ def analyze_video(
                 landmarks = result.pose_landmarks[0]
                 draw_skeleton_overlay(upright, landmarks)
                 metrics = compute_metrics(landmarks, handedness)
+                if not address_set and result.pose_world_landmarks:
+                    tracker.set_address(result.pose_world_landmarks[0])
+                    address_set = True
+                if result.pose_world_landmarks:
+                    world_landmarks = result.pose_world_landmarks[0]
+                    hip_rot, sho_rot, x_factor = tracker.metrics(world_landmarks)
+                    metrics["Hip Rotation"] = hip_rot
+                    metrics["Shoulder Rotation"] = sho_rot
+                    metrics["X-Factor"] = x_factor
 
             draw_metrics_hud(upright, metrics, frame_idx)
             writer.write(upright)
