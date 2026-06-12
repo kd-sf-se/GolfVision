@@ -9,10 +9,12 @@ import sys
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from types import SimpleNamespace
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import mediapipe as mp
+from phase_detection import detect_phases
 from world_rotation import RotationTracker
 
 DEFAULT_MODEL_PATH = Path(".models/pose_landmarker_full.task")
@@ -65,6 +67,7 @@ POSE_CONNECTIONS = tuple(
 ROTATIONS = (0, 90, 180, 270)
 HUD_BG = (20, 20, 20)
 HUD_TEXT = (255, 255, 255)
+PHASE_TEXT = (120, 255, 120)
 SKELETON_COLOR = (0, 255, 255)
 SKELETON_OUTLINE = (0, 0, 0)
 POINT_COLOR = (255, 80, 0)
@@ -363,6 +366,61 @@ def compute_metrics(landmarks: Sequence, handedness: str) -> Dict[str, Optional[
     }
 
 
+def empty_metrics() -> Dict[str, Optional[float]]:
+    return {
+        "Lead Elbow": None,
+        "Trail Elbow": None,
+        "Hip Rotation": None,
+        "Shoulder Rotation": None,
+        "X-Factor": None,
+    }
+
+
+def compact_world_keypoints(world_landmarks: Sequence) -> Dict[int, SimpleNamespace]:
+    indices = (
+        LANDMARK_INDEX["left_shoulder"],
+        LANDMARK_INDEX["right_shoulder"],
+        LANDMARK_INDEX["left_hip"],
+        LANDMARK_INDEX["right_hip"],
+    )
+    return {
+        idx: SimpleNamespace(
+            x=float(world_landmarks[idx].x),
+            y=float(world_landmarks[idx].y),
+            z=float(world_landmarks[idx].z),
+            visibility=float(getattr(world_landmarks[idx], "visibility", 1.0)),
+            presence=float(getattr(world_landmarks[idx], "presence", 1.0)),
+        )
+        for idx in indices
+    }
+
+
+def expand_world_keypoints(compact: Dict[int, SimpleNamespace]) -> List[SimpleNamespace]:
+    landmarks = [
+        SimpleNamespace(x=0.0, y=0.0, z=0.0, visibility=0.0, presence=0.0)
+        for _ in range(33)
+    ]
+    for idx, point in compact.items():
+        landmarks[idx] = point
+    return landmarks
+
+
+def raw_shoulder_heading(compact: Dict[int, SimpleNamespace]) -> Optional[float]:
+    left = compact.get(LANDMARK_INDEX["left_shoulder"])
+    right = compact.get(LANDMARK_INDEX["right_shoulder"])
+    if left is None or right is None:
+        return None
+    left_conf = min(left.visibility, left.presence)
+    right_conf = min(right.visibility, right.presence)
+    if left_conf < 0.4 or right_conf < 0.4:
+        return None
+    delta_x = right.x - left.x
+    delta_z = right.z - left.z
+    if math.hypot(delta_x, delta_z) < 1e-6:
+        return None
+    return math.degrees(math.atan2(delta_z, delta_x))
+
+
 def format_metric(value: Optional[float]) -> str:
     if value is None:
         return "N/A"
@@ -370,11 +428,16 @@ def format_metric(value: Optional[float]) -> str:
 
 
 def draw_metrics_hud(
-    frame: cv2.typing.MatLike, metrics: Dict[str, Optional[float]], frame_idx: int
+    frame: cv2.typing.MatLike,
+    metrics: Dict[str, Optional[float]],
+    frame_idx: int,
+    phase_label: Optional[str] = None,
 ) -> None:
     h, _ = frame.shape[:2]
-    panel_h = max(150, int(h * 0.22))
-    cv2.rectangle(frame, (0, 0), (560, panel_h), HUD_BG, -1)
+    metric_lines = len(metrics)
+    extra_phase_lines = 1 if phase_label else 0
+    panel_h = max(170, int(h * 0.30), 72 + (metric_lines + extra_phase_lines) * 32)
+    cv2.rectangle(frame, (0, 0), (640, panel_h), HUD_BG, -1)
 
     cv2.putText(
         frame,
@@ -400,6 +463,18 @@ def draw_metrics_hud(
             cv2.LINE_AA,
         )
         y += 32
+
+    if phase_label:
+        cv2.putText(
+            frame,
+            f"PHASE: {phase_label}",
+            (18, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.78,
+            PHASE_TEXT,
+            2,
+            cv2.LINE_AA,
+        )
 
 
 def safe_fps(capture: cv2.VideoCapture) -> float:
@@ -451,13 +526,16 @@ def analyze_video(
         landmarker = create_pose_landmarker(
             model_path=model_path, running_mode=mp.tasks.vision.RunningMode.VIDEO
         )
-        tracker = RotationTracker(smoothing_window=5)
-        address_set = False
+        side_map = side_mapping_for_handedness(handedness)
+        lead_wrist_idx = LANDMARK_INDEX[f"{side_map.lead}_wrist"]
 
         frame_idx = 0
         timestamp_ms = 0
         step_ms = max(1, int(round(1000.0 / fps)))
+        previous_wrist: Optional[Tuple[float, float]] = None
+        frame_cache: List[Dict[str, object]] = []
 
+        # Pass 1: run pose once and collect data for phase detection.
         while True:
             ok, frame = capture.read()
             if not ok:
@@ -468,34 +546,112 @@ def analyze_video(
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
-            metrics: Dict[str, Optional[float]] = {
-                "Lead Elbow": None,
-                "Trail Elbow": None,
-                "Hip Rotation": None,
-                "Shoulder Rotation": None,
+            frame_data: Dict[str, object] = {
+                "idx": frame_idx,
+                "pose_landmarks": None,
+                "world_keypoints": None,
+                "shoulder_rot_raw": None,
+                "wrist_y": None,
+                "hand_speed": None,
+                "pose_reliable": False,
+                "hip_rotation": None,
+                "shoulder_rotation": None,
+                "x_factor": None,
             }
+
             if result.pose_landmarks:
                 landmarks = result.pose_landmarks[0]
-                draw_skeleton_overlay(upright, landmarks)
-                metrics = compute_metrics(landmarks, handedness)
-                if not address_set and result.pose_world_landmarks:
-                    tracker.set_address(result.pose_world_landmarks[0])
-                    address_set = True
-                if result.pose_world_landmarks:
-                    world_landmarks = result.pose_world_landmarks[0]
-                    hip_rot, sho_rot, x_factor = tracker.metrics(world_landmarks)
-                    metrics["Hip Rotation"] = hip_rot
-                    metrics["Shoulder Rotation"] = sho_rot
-                    metrics["X-Factor"] = x_factor
+                frame_data["pose_landmarks"] = landmarks
+                frame_data["pose_reliable"] = True
 
-            draw_metrics_hud(upright, metrics, frame_idx)
-            writer.write(upright)
+                lead_wrist = landmarks[lead_wrist_idx]
+                if is_landmark_reliable(lead_wrist, 0.35):
+                    wrist_point = (float(lead_wrist.x), float(lead_wrist.y))
+                    frame_data["wrist_y"] = wrist_point[1]
+                    if previous_wrist is not None:
+                        frame_data["hand_speed"] = math.hypot(
+                            wrist_point[0] - previous_wrist[0],
+                            wrist_point[1] - previous_wrist[1],
+                        )
+                    previous_wrist = wrist_point
+
+            if result.pose_world_landmarks:
+                compact = compact_world_keypoints(result.pose_world_landmarks[0])
+                frame_data["world_keypoints"] = compact
+                frame_data["shoulder_rot_raw"] = raw_shoulder_heading(compact)
+
+            frame_cache.append(frame_data)
 
             frame_idx += 1
             timestamp_ms += step_ms
-
             if frame_idx % 100 == 0:
-                print(f"Processed {frame_idx} frames...")
+                print(f"Pass 1 collected {frame_idx} frames...")
+
+        if not frame_cache:
+            raise RuntimeError("No frames were decoded from the input video.")
+
+        phases = detect_phases(frame_cache)
+        print(
+            "Detected phases: "
+            f"address={phases['address']} top={phases['top']} "
+            f"impact={phases['impact']} finish={phases['finish']}"
+        )
+
+        tracker = RotationTracker(smoothing_window=5)
+        address_idx = phases.get("address", 0)
+        if 0 <= address_idx < len(frame_cache):
+            address_compact = frame_cache[address_idx].get("world_keypoints")
+            if isinstance(address_compact, dict):
+                tracker.set_address(expand_world_keypoints(address_compact))
+
+        phase_labels = {
+            phases.get("address", -1): "ADDRESS",
+            phases.get("top", -1): "TOP",
+            phases.get("impact", -1): "IMPACT",
+            phases.get("finish", -1): "FINISH",
+        }
+
+        # Pass 2: draw using cached landmarks and address-relative rotations.
+        capture.release()
+        capture = cv2.VideoCapture(str(input_path))
+        if not capture.isOpened():
+            raise RuntimeError("Unable to reopen input video for pass 2 rendering.")
+
+        frame_idx = 0
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                break
+
+            upright = rotate_frame(frame, selected_rotation)
+            if frame_idx >= len(frame_cache):
+                break
+            frame_data = frame_cache[frame_idx]
+
+            metrics = empty_metrics()
+            pose_landmarks = frame_data.get("pose_landmarks")
+            if pose_landmarks is not None:
+                landmarks = pose_landmarks
+                draw_skeleton_overlay(upright, landmarks)
+                metrics = compute_metrics(landmarks, handedness)
+            world_compact = frame_data.get("world_keypoints")
+            if isinstance(world_compact, dict):
+                world_landmarks = expand_world_keypoints(world_compact)
+                hip_rot, sho_rot, x_factor = tracker.metrics(world_landmarks)
+                metrics["Hip Rotation"] = hip_rot
+                metrics["Shoulder Rotation"] = sho_rot
+                metrics["X-Factor"] = x_factor
+                frame_data["hip_rotation"] = hip_rot
+                frame_data["shoulder_rotation"] = sho_rot
+                frame_data["x_factor"] = x_factor
+
+            phase_label = phase_labels.get(frame_idx)
+            draw_metrics_hud(upright, metrics, frame_idx, phase_label=phase_label)
+            writer.write(upright)
+
+            frame_idx += 1
+            if frame_idx % 100 == 0:
+                print(f"Pass 2 rendered {frame_idx} frames...")
 
         print(f"Completed. Processed {frame_idx} frames.")
     finally:
