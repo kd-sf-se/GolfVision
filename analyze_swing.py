@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sys
 import urllib.request
@@ -14,7 +15,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import mediapipe as mp
-from phase_detection import detect_phases
+from golf_benchmarks import BENCHMARKS, compare
+from phase_detection import detect_phases, kinematic_sequence_ok
 from world_rotation import RotationTracker
 
 DEFAULT_MODEL_PATH = Path(".models/pose_landmarker_full.task")
@@ -71,6 +73,9 @@ PHASE_TEXT = (120, 255, 120)
 SKELETON_COLOR = (0, 255, 255)
 SKELETON_OUTLINE = (0, 0, 0)
 POINT_COLOR = (255, 80, 0)
+VERDICT_IN_BAND = (80, 230, 80)
+VERDICT_LOW = (0, 200, 255)
+VERDICT_HIGH = (40, 40, 255)
 
 
 @dataclass(frozen=True)
@@ -421,6 +426,98 @@ def raw_shoulder_heading(compact: Dict[int, SimpleNamespace]) -> Optional[float]
     return math.degrees(math.atan2(delta_z, delta_x))
 
 
+def verdict_text_color(verdict: str) -> Tuple[int, int, int]:
+    if verdict == "in_band":
+        return VERDICT_IN_BAND
+    if verdict == "low":
+        return VERDICT_LOW
+    if verdict == "high":
+        return VERDICT_HIGH
+    return HUD_TEXT
+
+
+def normalize_verdict_payload(verdict: Dict[str, object]) -> Dict[str, object]:
+    normalized = dict(verdict)
+    band = normalized.get("band")
+    if isinstance(band, tuple):
+        normalized["band"] = list(band)
+    return normalized
+
+
+def score_top_checkpoint(metrics: Dict[str, Optional[float]]) -> Dict[str, Dict[str, object]]:
+    metric_map = {
+        "X-Factor": "x_factor",
+        "Shoulder Rotation": "shoulder_rotation_top",
+        "Hip Rotation": "hip_rotation_top",
+    }
+    verdicts: Dict[str, Dict[str, object]] = {}
+    for label, benchmark_key in metric_map.items():
+        value = metrics.get(label)
+        if value is None:
+            continue
+        verdicts[label] = normalize_verdict_payload(compare(benchmark_key, value, phase="top"))
+    return verdicts
+
+
+def build_summary_lines(
+    top_metrics: Dict[str, Optional[float]],
+    top_verdicts: Dict[str, Dict[str, object]],
+    sequence_ok: Optional[bool],
+) -> List[str]:
+    lines = ["GolfVision Summary", "Checkpoint: TOP"]
+    for label in ("X-Factor", "Shoulder Rotation", "Hip Rotation"):
+        value = top_metrics.get(label)
+        verdict = top_verdicts.get(label, {"verdict": "no_benchmark"})
+        verdict_name = str(verdict.get("verdict", "no_benchmark"))
+        source = str(verdict.get("source", "N/A"))
+        if value is None:
+            value_text = "N/A"
+        else:
+            value_text = f"{value:.1f} deg"
+        lines.append(f"{label}: {value_text} ({verdict_name}, {source})")
+
+    ofactor_source = BENCHMARKS["o_factor"]["source"]
+    lines.append(f"O-Factor: track only ({ofactor_source})")
+    if sequence_ok is None:
+        lines.append("Sequence: unavailable")
+    elif sequence_ok:
+        lines.append("Sequence: OK")
+    else:
+        lines.append("Sequence: reversed")
+    return lines
+
+
+def draw_summary_card(
+    frame: cv2.typing.MatLike, lines: List[str], frame_number: int
+) -> cv2.typing.MatLike:
+    card = frame.copy()
+    cv2.rectangle(card, (0, 0), (card.shape[1], card.shape[0]), (0, 0, 0), -1)
+    cv2.putText(
+        card,
+        f"Frame: {frame_number}",
+        (24, 42),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.9,
+        HUD_TEXT,
+        2,
+        cv2.LINE_AA,
+    )
+    y = 86
+    for line in lines:
+        cv2.putText(
+            card,
+            line,
+            (24, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.72,
+            HUD_TEXT,
+            2,
+            cv2.LINE_AA,
+        )
+        y += 36
+    return card
+
+
 def format_metric(value: Optional[float]) -> str:
     if value is None:
         return "N/A"
@@ -432,11 +529,16 @@ def draw_metrics_hud(
     metrics: Dict[str, Optional[float]],
     frame_idx: int,
     phase_label: Optional[str] = None,
+    metric_colors: Optional[Dict[str, Tuple[int, int, int]]] = None,
+    sequence_text: Optional[str] = None,
 ) -> None:
     h, _ = frame.shape[:2]
     metric_lines = len(metrics)
     extra_phase_lines = 1 if phase_label else 0
-    panel_h = max(170, int(h * 0.30), 72 + (metric_lines + extra_phase_lines) * 32)
+    extra_seq_lines = 1 if sequence_text else 0
+    panel_h = max(
+        170, int(h * 0.34), 72 + (metric_lines + extra_phase_lines + extra_seq_lines) * 32
+    )
     cv2.rectangle(frame, (0, 0), (640, panel_h), HUD_BG, -1)
 
     cv2.putText(
@@ -452,13 +554,16 @@ def draw_metrics_hud(
 
     y = 68
     for label, value in metrics.items():
+        text_color = HUD_TEXT
+        if metric_colors and label in metric_colors:
+            text_color = metric_colors[label]
         cv2.putText(
             frame,
             f"{label}: {format_metric(value)}",
             (18, y),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.72,
-            HUD_TEXT,
+            text_color,
             2,
             cv2.LINE_AA,
         )
@@ -472,6 +577,19 @@ def draw_metrics_hud(
             cv2.FONT_HERSHEY_SIMPLEX,
             0.78,
             PHASE_TEXT,
+            2,
+            cv2.LINE_AA,
+        )
+
+    if sequence_text:
+        y += 32 if phase_label else 0
+        cv2.putText(
+            frame,
+            sequence_text,
+            (18, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.78,
+            HUD_TEXT,
             2,
             cv2.LINE_AA,
         )
@@ -610,6 +728,12 @@ def analyze_video(
             phases.get("impact", -1): "IMPACT",
             phases.get("finish", -1): "FINISH",
         }
+        top_idx = phases.get("top", -1)
+        impact_idx = phases.get("impact", -1)
+        top_verdicts: Dict[str, Dict[str, object]] = {}
+        top_metrics_snapshot: Dict[str, Optional[float]] = {}
+        sequence_ok: Optional[bool] = None
+        last_rendered_frame: Optional[cv2.typing.MatLike] = None
 
         # Pass 2: draw using cached landmarks and address-relative rotations.
         capture.release()
@@ -645,14 +769,76 @@ def analyze_video(
                 frame_data["shoulder_rotation"] = sho_rot
                 frame_data["x_factor"] = x_factor
 
+            metric_colors: Dict[str, Tuple[int, int, int]] = {}
+            if frame_idx == top_idx:
+                top_metrics_snapshot = {
+                    "X-Factor": metrics.get("X-Factor"),
+                    "Shoulder Rotation": metrics.get("Shoulder Rotation"),
+                    "Hip Rotation": metrics.get("Hip Rotation"),
+                }
+                top_verdicts = score_top_checkpoint(metrics)
+                for metric_label, verdict in top_verdicts.items():
+                    verdict_name = str(verdict.get("verdict", "no_benchmark"))
+                    metric_colors[metric_label] = verdict_text_color(verdict_name)
+
+            if impact_idx >= 0 and frame_idx >= impact_idx and sequence_ok is None:
+                sequence_ok = kinematic_sequence_ok(frame_cache, top_idx)
+
             phase_label = phase_labels.get(frame_idx)
-            draw_metrics_hud(upright, metrics, frame_idx, phase_label=phase_label)
+            sequence_text = None
+            if impact_idx >= 0 and frame_idx >= impact_idx and sequence_ok is not None:
+                sequence_text = "Sequence: OK" if sequence_ok else "Sequence: reversed"
+            draw_metrics_hud(
+                upright,
+                metrics,
+                frame_idx,
+                phase_label=phase_label,
+                metric_colors=metric_colors,
+                sequence_text=sequence_text,
+            )
             writer.write(upright)
+            last_rendered_frame = upright.copy()
 
             frame_idx += 1
             if frame_idx % 100 == 0:
                 print(f"Pass 2 rendered {frame_idx} frames...")
 
+        summary_lines = build_summary_lines(top_metrics_snapshot, top_verdicts, sequence_ok)
+        if last_rendered_frame is not None:
+            summary_frame = draw_summary_card(last_rendered_frame, summary_lines, frame_idx)
+            freeze_frames = max(1, int(round(fps)))
+            for _ in range(freeze_frames):
+                writer.write(summary_frame)
+
+        summary_path = output_path.parent / "swing_summary.json"
+        o_factor_benchmark = BENCHMARKS["o_factor"]
+        summary_payload = {
+            "checkpoints": phases,
+            "checkpoint_metrics": {
+                "top": {
+                    "x_factor": top_metrics_snapshot.get("X-Factor"),
+                    "shoulder_rotation_top": top_metrics_snapshot.get("Shoulder Rotation"),
+                    "hip_rotation_top": top_metrics_snapshot.get("Hip Rotation"),
+                }
+            },
+            "verdicts": {
+                "top": top_verdicts,
+                "impact": {
+                    "o_factor": {
+                        "verdict": "no_benchmark",
+                        "metric": "o_factor",
+                        "source": o_factor_benchmark["source"],
+                        "note": "Track for consistency only - no published target.",
+                    }
+                },
+            },
+            "kinematic_sequence": {
+                "ok": sequence_ok,
+                "rule": "pelvis_before_torso",
+            },
+        }
+        summary_path.write_text(json.dumps(summary_payload, indent=2))
+        print(f"Wrote summary: {summary_path}")
         print(f"Completed. Processed {frame_idx} frames.")
     finally:
         if landmarker is not None:

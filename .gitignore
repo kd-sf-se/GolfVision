@@ -5,3 +5,4 @@ __pycache__/
 .models/
 sample_input.mp4
 swing_analyze.mp4
+swing_summary.json
