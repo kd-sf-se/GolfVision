@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+.DS_Store
+.tools/
+.models/
+sample_input.mp4
+swing_analyze.mp4
